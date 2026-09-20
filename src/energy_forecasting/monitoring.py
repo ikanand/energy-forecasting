@@ -18,35 +18,43 @@ def backfill_actuals(spark: SparkSession, cfg: ProjectConfig) -> pd.DataFrame:
     actual = read_pdf(spark, cfg, Tables.SILVER_ENERGY).rename(columns={"timestamp": "target_hour"})
     joined = fc.merge(actual, on="target_hour", how="inner").dropna(subset=["demand_mw"])
     joined = joined.rename(columns={"demand_mw": "actual_mw"})
+    if joined.empty:
+        # First daily run: tomorrow's forecast exists but no forecast hour has happened yet.
+        logger.info("No forecast hours have actuals yet - nothing to score today.")
+        return pd.DataFrame(columns=["forecast_date", "mape", "tso_mape", "hours", "model_version"])
+
     joined["abs_pct_error"] = (joined["predicted_mw"] - joined["actual_mw"]).abs() / joined["actual_mw"] * 100
     write_pdf(spark, cfg, joined, Tables.FORECAST_VS_ACTUAL)
     spark.sql(
         f"ALTER TABLE {cfg.table(Tables.FORECAST_VS_ACTUAL)} SET TBLPROPERTIES (delta.enableChangeDataFeed = true)"
     )
 
-    daily = (
-        joined.groupby("forecast_date")
-        .apply(
-            lambda g: pd.Series(
-                {
-                    "mape": mape(g["actual_mw"], g["predicted_mw"]),
-                    "tso_mape": mape(g["actual_mw"], g["tso_forecast_mw"]),
-                    "hours": len(g),
-                    "model_version": g["model_version"].iloc[-1],
-                }
-            ),
-            include_groups=False,
-        )
-        .reset_index()
-        .sort_values("forecast_date")
-    )
+    daily = daily_metrics(joined)
     write_pdf(spark, cfg, daily, Tables.DAILY_METRICS)
     logger.info(f"{len(joined)} forecast hours now have actuals across {len(daily)} day(s)")
     return daily
 
 
-def refresh_lakehouse_monitor(cfg: ProjectConfig) -> bool:
+def daily_metrics(joined: pd.DataFrame) -> pd.DataFrame:
+    """One row per forecast day: our MAPE, the grid operator's MAPE, hours scored, model version."""
+    rows = [
+        {
+            "forecast_date": day,
+            "mape": mape(g["actual_mw"], g["predicted_mw"]),
+            "tso_mape": mape(g["actual_mw"], g["tso_forecast_mw"]),
+            "hours": len(g),
+            "model_version": str(g["model_version"].iloc[-1]),
+        }
+        for day, g in joined.groupby("forecast_date")
+    ]
+    return pd.DataFrame(rows).sort_values("forecast_date").reset_index(drop=True)
+
+
+def refresh_lakehouse_monitor(cfg: ProjectConfig, has_data: bool = True) -> bool:
     """Create the monitor on first run, refresh afterwards. Returns False if the tier doesn't allow it."""
+    if not has_data:
+        logger.info("Skipping Lakehouse Monitoring: forecast_vs_actual has no rows yet.")
+        return False
     try:
         from databricks.sdk import WorkspaceClient
         from databricks.sdk.errors import NotFound
