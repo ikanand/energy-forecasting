@@ -11,6 +11,7 @@ artifacts:
     type: whl
     build: uv build --wheel
     path: .
+    dynamic_version: true      # <- add this line
 
 variables:
   git_sha:

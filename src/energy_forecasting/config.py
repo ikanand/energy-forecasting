@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, ConfigDict, model_validator
 
 VALID_ENVS = ("dev", "uat", "prod")
 
@@ -36,6 +36,8 @@ class TrainingSettings(BaseModel):
 
 
 class ProjectConfig(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())  # we use field names like model_name
+
     env: str
     catalog: str
     schema_name: str

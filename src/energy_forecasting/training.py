@@ -45,6 +45,19 @@ def _lookups(cfg: ProjectConfig) -> list:
     ]
 
 
+def version_for_run(versions: list, run_id: str) -> str:
+    """Pick the model version created by this run.
+
+    Unity Catalog only allows searching versions by name, so we filter by run_id here.
+    If MLflow 3 registered from a LoggedModel without a run_id, fall back to the newest version.
+    """
+    if not versions:
+        raise RuntimeError("No model versions found right after registration.")
+    matching = [v for v in versions if getattr(v, "run_id", None) == run_id]
+    candidates = matching or versions
+    return str(max(candidates, key=lambda v: int(v.version)).version)
+
+
 def champion_version(cfg: ProjectConfig) -> str | None:
     try:
         return MlflowClient().get_model_version_by_alias(cfg.model_name, CHAMPION).version
@@ -105,7 +118,7 @@ def train_and_register(spark: SparkSession, cfg: ProjectConfig, tags: Tags) -> T
         )
 
     client = MlflowClient()
-    version = client.search_model_versions(f"run_id='{run.info.run_id}'")[0].version
+    version = version_for_run(client.search_model_versions(f"name='{cfg.model_name}'"), run.info.run_id)
 
     # Score challenger and champion on the same unseen holdout, the same way production scores.
     keys = holdout.select("location_id", "timestamp")
