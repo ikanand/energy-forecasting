@@ -24,3 +24,15 @@ def test_daily_metrics_one_row_per_day_with_benchmark():
     assert daily.mape.round(6).tolist() == [10.0, 0.0]
     assert daily.tso_mape.round(6).tolist() == [1.0, 1.0]
     assert daily.hours.tolist() == [24, 24]
+
+
+def test_inference_log_appends_only_new_days_with_wallclock_time():
+    from energy_forecasting.monitoring import rows_to_log
+
+    hours = pd.date_range("2018-01-02", periods=72, freq="h")
+    joined = pd.DataFrame({"forecast_date": [h.date() for h in hours], "target_hour": hours, "predicted_mw": 1.0})
+    now = pd.Timestamp("2026-09-20 10:00")
+    new = rows_to_log(joined, already_logged_days={dt.date(2018, 1, 2)}, scored_at=now)
+    assert sorted(set(new.forecast_date)) == [dt.date(2018, 1, 3), dt.date(2018, 1, 4)]
+    assert len(new) == 48
+    assert (new.scored_at == now).all()  # real time, so the monitor's 30-day window includes it
