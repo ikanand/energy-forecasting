@@ -1,0 +1,25 @@
+# Data and secrets never go in git
+data/
+*.csv
+kaggle.json
+.env
+
+# Python / tooling
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+dist/
+build/
+*.egg-info/
+
+# Databricks bundle state
+.databricks/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

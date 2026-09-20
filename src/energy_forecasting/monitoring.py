@@ -1,0 +1,91 @@
+"""Join forecasts with actuals, compute daily accuracy, refresh Lakehouse Monitoring, decide on retraining."""
+
+from __future__ import annotations
+
+import pandas as pd
+from loguru import logger
+from pyspark.sql import SparkSession
+
+from energy_forecasting.config import ProjectConfig, Tables
+from energy_forecasting.decisions import mape, needs_retrain
+from energy_forecasting.lakehouse import read_pdf, write_pdf
+from energy_forecasting.training import champion_baseline_mape
+
+
+def backfill_actuals(spark: SparkSession, cfg: ProjectConfig) -> pd.DataFrame:
+    """Forecasts whose hours have now happened, joined with what actually happened."""
+    fc = read_pdf(spark, cfg, Tables.FORECAST)
+    actual = read_pdf(spark, cfg, Tables.SILVER_ENERGY).rename(columns={"timestamp": "target_hour"})
+    joined = fc.merge(actual, on="target_hour", how="inner").dropna(subset=["demand_mw"])
+    joined = joined.rename(columns={"demand_mw": "actual_mw"})
+    joined["abs_pct_error"] = (joined["predicted_mw"] - joined["actual_mw"]).abs() / joined["actual_mw"] * 100
+    write_pdf(spark, cfg, joined, Tables.FORECAST_VS_ACTUAL)
+    spark.sql(
+        f"ALTER TABLE {cfg.table(Tables.FORECAST_VS_ACTUAL)} SET TBLPROPERTIES (delta.enableChangeDataFeed = true)"
+    )
+
+    daily = (
+        joined.groupby("forecast_date")
+        .apply(
+            lambda g: pd.Series(
+                {
+                    "mape": mape(g["actual_mw"], g["predicted_mw"]),
+                    "tso_mape": mape(g["actual_mw"], g["tso_forecast_mw"]),
+                    "hours": len(g),
+                    "model_version": g["model_version"].iloc[-1],
+                }
+            ),
+            include_groups=False,
+        )
+        .reset_index()
+        .sort_values("forecast_date")
+    )
+    write_pdf(spark, cfg, daily, Tables.DAILY_METRICS)
+    logger.info(f"{len(joined)} forecast hours now have actuals across {len(daily)} day(s)")
+    return daily
+
+
+def refresh_lakehouse_monitor(cfg: ProjectConfig) -> bool:
+    """Create the monitor on first run, refresh afterwards. Returns False if the tier doesn't allow it."""
+    try:
+        from databricks.sdk import WorkspaceClient
+        from databricks.sdk.errors import NotFound
+        from databricks.sdk.service.catalog import MonitorInferenceLog, MonitorInferenceLogProblemType
+
+        w = WorkspaceClient()
+        table = cfg.table(Tables.FORECAST_VS_ACTUAL)
+        try:
+            w.quality_monitors.get(table)
+            w.quality_monitors.run_refresh(table_name=table)
+            logger.info("Lakehouse Monitoring refreshed")
+        except NotFound:
+            w.quality_monitors.create(
+                table_name=table,
+                assets_dir=f"/Workspace/Shared/lakehouse_monitoring/{table}",
+                output_schema_name=f"{cfg.catalog}.{cfg.schema_name}",
+                inference_log=MonitorInferenceLog(
+                    problem_type=MonitorInferenceLogProblemType.PROBLEM_TYPE_REGRESSION,
+                    prediction_col="predicted_mw",
+                    label_col="actual_mw",
+                    timestamp_col="target_hour",
+                    model_id_col="model_version",
+                    granularities=["1 day"],
+                ),
+            )
+            logger.info("Lakehouse Monitoring created (drift + accuracy dashboards appear in the table's Quality tab)")
+        return True
+    except Exception as e:  # trial tiers may not include it; daily metrics table still works
+        logger.warning(f"Lakehouse Monitoring unavailable, using forecast_daily_metrics only: {e}")
+        return False
+
+
+def retrain_needed(cfg: ProjectConfig, daily: pd.DataFrame) -> bool:
+    baseline = champion_baseline_mape(cfg)
+    if baseline is None or daily.empty:
+        return False
+    decision = needs_retrain(daily["mape"], baseline, cfg.degradation_ratio, cfg.consecutive_days)
+    logger.info(
+        f"Baseline MAPE {baseline:.2f}%, last {cfg.consecutive_days} days: "
+        f"{daily['mape'].tail(cfg.consecutive_days).round(2).tolist()} -> retrain={decision}"
+    )
+    return decision

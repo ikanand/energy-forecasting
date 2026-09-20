@@ -1,0 +1,56 @@
+name: CD
+
+# Merge to main -> deploy + run the training pipeline in uat -> a human approves -> deploy to prod.
+# The same commit (and wheel) goes to both; prod retrains on prod data (deploy-code pattern).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+  DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+  DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+
+jobs:
+  deploy-uat:
+    runs-on: ubuntu-latest
+    environment: uat
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: astral-sh/setup-uv@0c5e2b8115b80b4c7c5ddf6ffdd634974642d182 # v5.4.1
+      - uses: databricks/setup-cli@49580195afe1ccb06d195764a1d0ae9fabfe2edd # v0.246.0
+        with:
+          version: 1.17.0
+
+      - name: Deploy bundle to uat
+        run: databricks bundle deploy -t uat --var="git_sha=${{ github.sha }}" --var="branch=${{ github.ref_name }}"
+
+      - name: Run training pipeline in uat (integration test)
+        run: databricks bundle run training -t uat
+
+  deploy-prod:
+    needs: deploy-uat
+    runs-on: ubuntu-latest
+    environment: prod          # GitHub Environment with a required reviewer = manual approval gate
+    permissions:
+      contents: write          # to push the release tag
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: astral-sh/setup-uv@0c5e2b8115b80b4c7c5ddf6ffdd634974642d182 # v5.4.1
+      - uses: databricks/setup-cli@49580195afe1ccb06d195764a1d0ae9fabfe2edd # v0.246.0
+        with:
+          version: 1.17.0
+
+      - name: Deploy bundle to prod
+        run: databricks bundle deploy -t prod --var="git_sha=${{ github.sha }}" --var="branch=${{ github.ref_name }}"
+
+      - name: Tag release from version.txt
+        run: |
+          VERSION="v$(cat version.txt)"
+          if git ls-remote --exit-code --tags origin "$VERSION" >/dev/null; then
+            echo "::warning::Tag $VERSION already exists - bump version.txt for the next release"
+          else
+            git tag "$VERSION" && git push origin "$VERSION"
+          fi

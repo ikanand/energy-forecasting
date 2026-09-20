@@ -1,0 +1,109 @@
+# Three workflows. Every task runs a thin script from scripts/ on serverless compute,
+# with the project wheel installed. --env ${bundle.target} selects the catalog.
+
+resources:
+  jobs:
+    # -- 1. One-time per environment ------------------------------------------------
+    setup:
+      name: energy-forecasting-setup
+      tags: { project: energy_forecasting }
+      environments: &env
+        - environment_key: default
+          spec:
+            environment_version: "3"
+            dependencies:
+              - ../dist/*.whl
+      tasks:
+        - task_key: setup
+          environment_key: default
+          spark_python_task:
+            python_file: ../scripts/00_setup.py
+            parameters: &common   # reused by every task below via *common
+              - "--root_path"
+              - "${workspace.root_path}"
+              - "--env"
+              - "${bundle.target}"
+              - "--git_sha"
+              - "${var.git_sha}"
+              - "--branch"
+              - "${var.branch}"
+              - "--job_run_id"
+              - "{{job.run_id}}"
+        - task_key: build_features
+          depends_on: [{ task_key: setup }]
+          environment_key: default
+          spark_python_task: { python_file: ../scripts/03_build_features.py, parameters: *common }
+
+    # -- 2. Train -> register -> (only if better) promote -------------------------
+    training:
+      name: energy-forecasting-training
+      tags: { project: energy_forecasting }
+      environments: *env
+      schedule:
+        quartz_cron_expression: "0 0 4 ? * SUN"   # weekly safety-net retrain
+        timezone_id: UTC
+        pause_status: ${var.schedule_pause_status}
+      tasks:
+        - task_key: validate_data
+          environment_key: default
+          spark_python_task:
+            python_file: ../scripts/02_validate_data.py
+            parameters: [ "--root_path", "${workspace.root_path}", "--env", "${bundle.target}", "--window_days", "30" ]
+        - task_key: build_features
+          depends_on: [{ task_key: validate_data }]
+          environment_key: default
+          spark_python_task: { python_file: ../scripts/03_build_features.py, parameters: *common }
+        - task_key: train_register
+          depends_on: [{ task_key: build_features }]
+          environment_key: default
+          spark_python_task: { python_file: ../scripts/04_train_register.py, parameters: *common }
+        - task_key: model_improved
+          depends_on: [{ task_key: train_register }]
+          condition_task:
+            op: EQUAL_TO
+            left: "{{tasks.train_register.values.model_improved}}"
+            right: "1"
+        - task_key: promote
+          depends_on: [{ task_key: model_improved, outcome: "true" }]
+          environment_key: default
+          spark_python_task: { python_file: ../scripts/05_promote_model.py, parameters: *common }
+
+    # -- 3. Daily: new data -> check -> features -> forecast -> monitor -> maybe retrain
+    daily_forecast:
+      name: energy-forecasting-daily
+      tags: { project: energy_forecasting }
+      environments: *env
+      schedule:
+        quartz_cron_expression: "0 0 5 * * ?"
+        timezone_id: UTC
+        pause_status: ${var.schedule_pause_status}
+      tasks:
+        - task_key: replay_next_day
+          environment_key: default
+          spark_python_task: { python_file: ../scripts/01_replay_next_day.py, parameters: *common }
+        - task_key: validate_data
+          depends_on: [{ task_key: replay_next_day }]
+          environment_key: default
+          spark_python_task: { python_file: ../scripts/02_validate_data.py, parameters: *common }
+        - task_key: build_features
+          depends_on: [{ task_key: validate_data }]
+          environment_key: default
+          spark_python_task: { python_file: ../scripts/03_build_features.py, parameters: *common }
+        - task_key: forecast
+          depends_on: [{ task_key: build_features }]
+          environment_key: default
+          spark_python_task: { python_file: ../scripts/06_forecast_next_day.py, parameters: *common }
+        - task_key: monitor
+          depends_on: [{ task_key: forecast }]
+          environment_key: default
+          spark_python_task: { python_file: ../scripts/07_monitor.py, parameters: *common }
+        - task_key: needs_retrain
+          depends_on: [{ task_key: monitor }]
+          condition_task:
+            op: EQUAL_TO
+            left: "{{tasks.monitor.values.needs_retrain}}"
+            right: "1"
+        - task_key: retrain
+          depends_on: [{ task_key: needs_retrain, outcome: "true" }]
+          run_job_task:
+            job_id: ${resources.jobs.training.id}

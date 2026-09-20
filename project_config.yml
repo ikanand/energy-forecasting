@@ -1,0 +1,66 @@
+# Single source of truth for names and settings. Code never hardcodes these.
+# Scripts load it with ProjectConfig.from_yaml(path, env) where env is dev|uat|prod.
+
+environments:
+  dev:
+    catalog: mlops_dev
+    schema: energy_forecasting
+  uat:
+    catalog: mlops_uat
+    schema: energy_forecasting
+  prod:
+    catalog: mlops_prod
+    schema: energy_forecasting
+
+project:
+  location_id: ES                       # Spain, single region in this dataset
+  timezone: Europe/Madrid               # used for calendar features only; all keys are UTC
+  model_name: energy_demand_model       # registered as <catalog>.<schema>.energy_demand_model
+  experiment_name: /Shared/energy_forecasting_{env}
+  endpoint_name: energy-demand-{env}
+
+data:
+  volume: raw_data                      # /Volumes/<catalog>/<schema>/raw_data
+  energy_file: energy_dataset.csv
+  weather_file: weather_features.csv
+
+replay:
+  # Kaggle data is 2015-2018 history. Everything before start_date is "the past";
+  # the daily workflow then releases one day at a time to simulate a live feed.
+  enabled: true
+  start_date: "2018-01-01"
+
+features:
+  # Day-ahead: forecasts for tomorrow are made after today closes, so every
+  # demand-based feature must look back at least 24 hours.
+  min_lag_hours: 24
+  lags_hours: [24, 48, 168]
+  rolling_windows_hours: [24, 168]
+  weather_columns: [temp_c, humidity, wind_speed, clouds_all]
+
+training:
+  holdout_days: 14                      # most recent days, never seen in training
+  validation_days: 14                   # tuning window just before the holdout
+  n_trials: 20
+  random_state: 42
+  search_space:
+    n_estimators: [200, 800]
+    num_leaves: [15, 127]
+    learning_rate: [0.01, 0.2]
+    min_child_samples: [10, 60]
+
+promotion:
+  min_improvement_pct: 1.0              # challenger must beat champion MAPE by at least 1%
+
+monitoring:
+  degradation_ratio: 1.25               # alert when daily MAPE > 1.25 x champion's holdout MAPE
+  consecutive_days: 3                   # ...for this many days in a row
+
+quality:
+  max_null_fraction: 0.02
+  demand_min_mw: 10000
+  demand_max_mw: 50000
+  expected_cities: 5
+
+serving:
+  enabled: false                        # real-time endpoint is optional; turned on in Step 10
